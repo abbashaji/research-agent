@@ -71,7 +71,14 @@ def call_llm(findings: list) -> dict:
             {"role": "user", "content": json.dumps(findings)[:24000]},  # keep request small/cheap
         ],
         "temperature": 0.2,
-        "max_tokens": 500,
+        # gpt-oss models are reasoning models -- Groq bills hidden reasoning
+        # tokens against max_tokens too, so a low cap can be entirely eaten
+        # by reasoning and leave nothing for the actual JSON answer (this is
+        # exactly what happened with 500: empty content, "unparsed" top_gap).
+        # reasoning_effort="low" keeps that overhead small for a task this
+        # simple, and 1200 leaves comfortable room for the answer either way.
+        "max_tokens": 1200,
+        "reasoning_effort": "low",
     }
     req = urllib.request.Request(
         LLM_BASE_URL,
@@ -98,6 +105,16 @@ def call_llm(findings: list) -> dict:
 
     raw = data["choices"][0]["message"]["content"].strip()
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    if not raw:
+        # Distinguish "model answered but gave us nothing" from "model gave
+        # us text that just wasn't valid JSON" -- these have different fixes
+        # (raise max_tokens/reasoning_effort vs. tighten the prompt).
+        finish_reason = data["choices"][0].get("finish_reason", "unknown")
+        return {
+            "cluster_count": None,
+            "synthesis": f"[enrichment failed: empty response, finish_reason={finish_reason}]",
+            "top_gap": "n/a",
+        }
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
