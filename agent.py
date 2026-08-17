@@ -365,19 +365,26 @@ def main():
     if not args.no_db:
         client = get_client()
         if client:
-            ensure_schema(client)
-            known_hashes = get_known_hashes(client, args.topic)   # BEFORE insert -- this is the diff baseline
-            is_first_run = len(known_hashes) == 0
-            new_findings = [f for f in all_findings if f.content_hash not in known_hashes]
+            try:
+                ensure_schema(client)
+                known_hashes = get_known_hashes(client, args.topic)   # BEFORE insert -- this is the diff baseline
+                is_first_run = len(known_hashes) == 0
+                new_findings = [f for f in all_findings if f.content_hash not in known_hashes]
 
-            persist(client, args.topic, run_id, all_findings, n_new=len(new_findings))
-            print(f"[db] wrote {len(all_findings)} findings ({len(new_findings)} new) to Turso", file=sys.stderr)
+                persist(client, args.topic, run_id, all_findings, n_new=len(new_findings))
+                print(f"[db] wrote {len(all_findings)} findings ({len(new_findings)} new) to Turso", file=sys.stderr)
 
-            if args.enrich and new_findings:
-                from enrich import enrich_run
-                enrichment = enrich_run(client, args.topic, run_id, new_findings,
-                                         dt.datetime.now(dt.UTC).isoformat())
-                print("[llm] enrichment written to Turso", file=sys.stderr)
+                if args.enrich and new_findings:
+                    from enrich import enrich_run
+                    enrichment = enrich_run(client, args.topic, run_id, new_findings,
+                                             dt.datetime.now(dt.UTC).isoformat())
+                    print("[llm] enrichment written to Turso", file=sys.stderr)
+            finally:
+                # libsql_client's sync wrapper runs a background thread with its
+                # own event loop -- if this isn't closed, the thread keeps the
+                # whole process alive and the script (and the CI step) never
+                # exits, even after all work is done.
+                client.close()
         else:
             print("[db] TURSO_DATABASE_URL / TURSO_AUTH_TOKEN not set — skipping persistence (no diff without a DB)", file=sys.stderr)
 
