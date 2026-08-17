@@ -1,0 +1,37 @@
+# Save this file as .github/workflows/research.yml in your repo.
+# GitHub Actions free tier = the "24/7 forever" part: runs on schedule
+# indefinitely at $0 for public repos (and within free minutes for private).
+name: research-agent
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # every 4 hours -- adjust cadence as you like
+  workflow_dispatch:         # lets you trigger a run manually from the Actions tab
+    inputs:
+      topic:
+        description: "Product idea to research"
+        required: true
+        default: "procedural building generator"
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run research pass
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python agent.py "${{ github.event.inputs.topic || 'procedural building generator' }}" \
+            > digest_$(date +%Y%m%dT%H%M%S).md
+      - name: Upload digest as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-digest
+          path: digest_*.md
