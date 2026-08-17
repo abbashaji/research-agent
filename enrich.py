@@ -18,9 +18,11 @@ serving an OpenAI-compatible endpoint, etc.) without changing this file.
 
 import json
 import os
+import sys
 from dataclasses import asdict
 
 import urllib.request
+import urllib.error
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
@@ -74,11 +76,26 @@ def call_llm(findings: list) -> dict:
     req = urllib.request.Request(
         LLM_BASE_URL,
         data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+            # Groq's Cloudflare front-end 403s bare urllib requests with no
+            # User-Agent (error code 1010) -- this header is required, not cosmetic.
+            "User-Agent": "research-agent/1.0 (+https://github.com/)",
+        },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:500]
+        print(f"[llm] enrichment call failed: HTTP {e.code} -- {body}", file=sys.stderr)
+        return {"cluster_count": None, "synthesis": f"[enrichment failed: HTTP {e.code}]", "top_gap": "n/a"}
+    except urllib.error.URLError as e:
+        print(f"[llm] enrichment call failed: {e.reason}", file=sys.stderr)
+        return {"cluster_count": None, "synthesis": f"[enrichment failed: {e.reason}]", "top_gap": "n/a"}
+
     raw = data["choices"][0]["message"]["content"].strip()
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
