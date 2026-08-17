@@ -137,7 +137,7 @@ def to_finding(run_id: str, pass_type: str, query: str, r: dict) -> Finding:
         has_paid_signal=bool(PAID_SIGNAL_RE.search(blob)),
         has_complaint_signal=bool(COMPLAINT_RE.search(blob)),
         has_adversarial_signal=bool(ADVERSARIAL_RE.search(blob)),
-        fetched_at=dt.datetime.utcnow().isoformat(),
+        fetched_at=dt.datetime.now(dt.UTC).isoformat(),
         content_hash=hashlib.sha256(blob.encode()).hexdigest()[:16],
         tier=2,
     )
@@ -158,7 +158,7 @@ def to_finding_from_source(run_id: str, pass_type: str, query: str, r: dict) -> 
         has_paid_signal=bool(PAID_SIGNAL_RE.search(blob)),
         has_complaint_signal=bool(COMPLAINT_RE.search(blob)),
         has_adversarial_signal=bool(ADVERSARIAL_RE.search(blob)),
-        fetched_at=dt.datetime.utcnow().isoformat(),
+        fetched_at=dt.datetime.now(dt.UTC).isoformat(),
         content_hash=hashlib.sha256(blob.encode()).hexdigest()[:16],
         tier=r.get("tier", 1),
         engagement_signal=r.get("engagement_signal", 0),
@@ -217,7 +217,14 @@ CREATE TABLE IF NOT EXISTS runs (
 def get_client():
     if not (TURSO_URL and TURSO_TOKEN):
         return None
-    return libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_TOKEN)
+    # libsql-client's WebSocket transport (libsql:// or wss://) fails a
+    # handshake against some Turso replicas (seen on GitHub Actions runners --
+    # aiohttp.WSServerHandshakeError: 400). The HTTP transport (https://) talks
+    # to the same database over plain HTTPS instead and sidesteps this
+    # entirely, so normalize the scheme regardless of what was pasted from the
+    # Turso dashboard (which shows libsql:// by default).
+    url = TURSO_URL.replace("libsql://", "https://").replace("wss://", "https://")
+    return libsql_client.create_client_sync(url=url, auth_token=TURSO_TOKEN)
 
 
 def ensure_schema(client):
@@ -262,7 +269,7 @@ def persist(client, topic: str, run_id: str, findings: list[Finding], n_new: int
     client.execute(
         """INSERT OR REPLACE INTO runs (run_id, topic, started_at, finished_at, n_findings, n_distinct_domains, n_new)
            VALUES (?,?,?,?,?,?,?)""",
-        [run_id, topic, findings[0].fetched_at if findings else "", dt.datetime.utcnow().isoformat(),
+        [run_id, topic, findings[0].fetched_at if findings else "", dt.datetime.now(dt.UTC).isoformat(),
          len(findings), domains, n_new],
     )
 
@@ -340,7 +347,7 @@ def main():
     ap.add_argument("--skip-scrape", action="store_true", help="official sources only, skip the tier-2 DuckDuckGo pass entirely")
     args = ap.parse_args()
 
-    run_id = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    run_id = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S")
     all_findings: list[Finding] = []
 
     print("[pass] official sources (tier 1/2, keyless APIs) ...", file=sys.stderr)
@@ -369,7 +376,7 @@ def main():
             if args.enrich and new_findings:
                 from enrich import enrich_run
                 enrichment = enrich_run(client, args.topic, run_id, new_findings,
-                                         dt.datetime.utcnow().isoformat())
+                                         dt.datetime.now(dt.UTC).isoformat())
                 print("[llm] enrichment written to Turso", file=sys.stderr)
         else:
             print("[db] TURSO_DATABASE_URL / TURSO_AUTH_TOKEN not set — skipping persistence (no diff without a DB)", file=sys.stderr)
