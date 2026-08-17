@@ -22,14 +22,14 @@ def main():
         print("Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN first ($env:VAR = \"...\")")
         sys.exit(1)
     url = url.replace("libsql://", "https://").replace("wss://", "https://")
-    client = libsql_client.create_client_sync(url=url, auth_token=token)
-    result = client.execute(sys.argv[1])
-    if result.columns:
-        print(" | ".join(result.columns))
-        print("-" * 60)
-    for row in result.rows:
-        print(" | ".join(str(v) for v in row))
-    print(f"\n({len(result.rows)} rows)")
+    with libsql_client.create_client_sync(url=url, auth_token=token) as client:
+        result = client.execute(sys.argv[1])
+        if result.columns:
+            print(" | ".join(result.columns))
+            print("-" * 60)
+        for row in result.rows:
+            print(" | ".join(str(v) for v in row))
+        print(f"\n({len(result.rows)} rows)")
 
 if __name__ == "__main__":
     main()
