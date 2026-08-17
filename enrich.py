@@ -26,7 +26,7 @@ import urllib.error
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-20b")
 
 ENRICH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS enrichment (
