@@ -63,14 +63,20 @@ COMPLAINT_RE = re.compile(
     r"tedious|manual(ly)?|slow to|time.?consuming)\b", re.I
 )
 # Broadened beyond the original 3 phrases -- covers issue-tracker rejection
-# language ("wontfix", "not planned"), dismissiveness ("pointless", "overkill",
-# "gimmick"), and "just do X manually instead" redirection, which are the
-# actual shapes adversarial pushback takes in the wild, not just "already exists".
+# language ("wontfix", "not planned") and "just do X manually instead"
+# redirection, which are real shapes adversarial pushback takes. Deliberately
+# does NOT include bare single words like "overkill"/"pointless"/"gimmick"/
+# "unnecessary" anymore -- those were tried and produced false positives on
+# completely unrelated content (a Discord server literally named "Overkill",
+# a Patreon artist, a Raid Shadow Legends comment) whenever DDG's scrape
+# returned loosely-matched or off-topic junk. Multi-word phrases below are
+# much less likely to appear by coincidence in unrelated text.
 ADVERSARIAL_RE = re.compile(
     r"\b(already (solved|exists|does this)|not (a|really a) problem|use .* instead|"
     r"non.?issue|works fine|don'?t need|won'?t ?fix|wont ?fix|not planned|"
-    r"pointless|overkill|gimmick|just (do|use|export) .* manually|"
-    r"unnecessary|not worth (it|building)|reinvent(ing)? the wheel)\b", re.I
+    r"such a gimmick|complete(ly)? overkill|totally unnecessary|"
+    r"just (do|use|export) .* manually|"
+    r"not worth (it|building)|reinvent(ing)? the wheel)\b", re.I
 )
 
 # The 5 pass types, matched to pmf-engine's method.
@@ -153,6 +159,24 @@ def classify_domain(url: str) -> tuple[str, str]:
     return domain, platform
 
 
+_RELEVANCE_TERMS = ("blender", "addon", "add-on", "geometry node", "plugin")
+
+
+def _is_topic_relevant(blob: str) -> bool:
+    """DDG scrape (tier 2) has no query-side relevance filter the way GitHub's
+    search API or a site: filter does -- when a query gets broadened (site:
+    dropped, phrases unquoted) to recover from a 0-result miss, it can widen
+    enough to pull back completely unrelated pages that happen to contain a
+    matched word (e.g. a Discord server literally named "Overkill", nothing
+    to do with Blender). Require at least one real domain term to actually
+    appear before trusting a paid/complaint/adversarial signal match from
+    this path -- official-API findings (to_finding_from_source) don't need
+    this, they're already scoped by the query itself (repo filter, devtalk/hn
+    search)."""
+    b = blob.lower()
+    return any(term in b for term in _RELEVANCE_TERMS)
+
+
 def to_finding(run_id: str, pass_type: str, query: str, r: dict) -> Finding:
     """DuckDuckGo result -> Finding. Always tier=2: this is the scrape path,
     explicitly the weakest-legitimacy source (see module docstring)."""
@@ -161,6 +185,7 @@ def to_finding(run_id: str, pass_type: str, query: str, r: dict) -> Finding:
     url = r.get("href", "") or r.get("url", "") or ""
     domain, platform = classify_domain(url)
     blob = f"{title} {body}"
+    relevant = _is_topic_relevant(blob)
     return Finding(
         run_id=run_id,
         pass_type=pass_type,
@@ -170,9 +195,9 @@ def to_finding(run_id: str, pass_type: str, query: str, r: dict) -> Finding:
         snippet=body.strip()[:500],
         platform=platform,
         domain=domain,
-        has_paid_signal=bool(PAID_SIGNAL_RE.search(blob)),
-        has_complaint_signal=bool(COMPLAINT_RE.search(blob)),
-        has_adversarial_signal=bool(ADVERSARIAL_RE.search(blob)),
+        has_paid_signal=relevant and bool(PAID_SIGNAL_RE.search(blob)),
+        has_complaint_signal=relevant and bool(COMPLAINT_RE.search(blob)),
+        has_adversarial_signal=relevant and bool(ADVERSARIAL_RE.search(blob)),
         fetched_at=dt.datetime.now(dt.UTC).isoformat(),
         content_hash=hashlib.sha256(blob.encode()).hexdigest()[:16],
         tier=2,
