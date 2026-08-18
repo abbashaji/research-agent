@@ -259,6 +259,52 @@ def run_pass(topic: str, pass_type: str, run_id: str, max_results: int = 8) -> l
     return findings
 
 
+_STOPWORDS = frozenset("""
+a an the of for and or to in on with that this need needs needing wants wanting
+who which practitioners studios like doing bespoke such as into first class not
+just a the be become inside native system practitioners boutique
+""".split())
+
+
+def heuristic_shorten_topic(topic: str, max_words: int = 8) -> str:
+    """Zero-cost, no-LLM fallback for shortening a long descriptive topic into
+    something closer to a search query: drop parenthetical asides (usually
+    examples/context, not core terms), strip stopwords, keep the first
+    max_words significant tokens in original order. Not as good as an LLM
+    read of what actually matters, but free and always available."""
+    no_parens = re.sub(r"\([^)]*\)", " ", topic)
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", no_parens)
+    kept = [w for w in words if w.lower() not in _STOPWORDS]
+    return " ".join(kept[:max_words]) if kept else topic[:60]
+
+
+def derive_search_topic(topic: str, use_llm: bool, length_threshold: int = 60) -> str:
+    """Long, descriptive topics (a full sentence describing a target user/use
+    case) break the narrower query templates -- adversarial phrase matching
+    and GitHub's label:wontfix search need concrete search terms, not a
+    paragraph. Short topics pass through unchanged (existing behavior,
+    zero-cost). Long topics get shortened either by a cheap LLM call (if
+    --enrich is on, since that already requires GROQ_API_KEY -- keeping the
+    "no LLM in the main path unless you opted in" rule from the top of this
+    file) or a free heuristic fallback otherwise, and the LLM path also falls
+    back to the heuristic on any failure rather than searching the raw
+    paragraph."""
+    if len(topic) <= length_threshold:
+        return topic
+    if use_llm:
+        try:
+            from enrich import extract_search_keywords
+            keywords = extract_search_keywords(topic)
+            if keywords:
+                print(f"  [keywords] LLM-shortened topic for search: {keywords!r}", file=sys.stderr)
+                return keywords
+        except Exception as e:
+            print(f"  [warn] keyword extraction failed, using heuristic fallback: {e}", file=sys.stderr)
+    shortened = heuristic_shorten_topic(topic)
+    print(f"  [keywords] heuristic-shortened topic for search: {shortened!r}", file=sys.stderr)
+    return shortened
+
+
 def run_official_sources(topic: str, run_id: str, max_results: int = 8) -> list[Finding]:
     """Tier 1 (+ tier 2 HN). Official, keyless APIs -- the legitimate-first path."""
     findings = []
@@ -295,7 +341,8 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY, topic TEXT, started_at TEXT, finished_at TEXT,
-    n_findings INTEGER, n_distinct_domains INTEGER, n_new INTEGER DEFAULT 0
+    n_findings INTEGER, n_distinct_domains INTEGER, n_new INTEGER DEFAULT 0,
+    search_keywords TEXT  -- the actual short query text used, if topic was auto-shortened
 );
 """
 
@@ -319,7 +366,8 @@ def ensure_schema(client):
             client.execute(stmt)
     # best-effort migration for DBs created before tier/engagement_signal existed
     for col, ddl in [("tier", "ALTER TABLE findings ADD COLUMN tier INTEGER DEFAULT 2"),
-                      ("engagement_signal", "ALTER TABLE findings ADD COLUMN engagement_signal INTEGER DEFAULT 0")]:
+                      ("engagement_signal", "ALTER TABLE findings ADD COLUMN engagement_signal INTEGER DEFAULT 0"),
+                      ("search_keywords", "ALTER TABLE runs ADD COLUMN search_keywords TEXT")]:
         try:
             client.execute(ddl)
         except Exception:
@@ -333,7 +381,7 @@ def get_known_hashes(client, topic: str) -> set[str]:
     return {row[0] for row in rs.rows}
 
 
-def persist(client, topic: str, run_id: str, findings: list[Finding], n_new: int):
+def persist(client, topic: str, run_id: str, findings: list[Finding], n_new: int, search_keywords: str = ""):
     ensure_schema(client)
     for f in findings:
         d = asdict(f)
@@ -352,11 +400,26 @@ def persist(client, topic: str, run_id: str, findings: list[Finding], n_new: int
         except Exception as e:
             print(f"  [warn] insert failed: {e}", file=sys.stderr)
     domains = len({f.domain for f in findings})
+    # findings has UNIQUE(topic, content_hash), so INSERT OR IGNORE silently
+    # drops same-run duplicates (overlapping query templates often surface the
+    # same URL). len(findings) is the pre-dedup count gathered in memory, not
+    # what actually landed in the table -- query the real number back out
+    # rather than trust the in-memory count, so n_findings/n_new in `runs`
+    # reflect what's actually queryable afterward, not an inflated estimate.
+    rs = client.execute("SELECT COUNT(*) FROM findings WHERE run_id = ?", [run_id])
+    actual_rows = rs.rows[0][0]
+    if actual_rows != len(findings):
+        print(f"  [info] {len(findings)} findings gathered, {actual_rows} actually new "
+              f"(within-run duplicates across overlapping query templates were dropped)", file=sys.stderr)
+    # n_new was computed by the caller against known_hashes from BEFORE this
+    # run started, so it can also overcount for the same reason -- cap it at
+    # what's actually in the table now for this run_id.
+    n_new_actual = min(n_new, actual_rows)
     client.execute(
-        """INSERT OR REPLACE INTO runs (run_id, topic, started_at, finished_at, n_findings, n_distinct_domains, n_new)
-           VALUES (?,?,?,?,?,?,?)""",
+        """INSERT OR REPLACE INTO runs (run_id, topic, started_at, finished_at, n_findings, n_distinct_domains, n_new, search_keywords)
+           VALUES (?,?,?,?,?,?,?,?)""",
         [run_id, topic, findings[0].fetched_at if findings else "", dt.datetime.now(dt.UTC).isoformat(),
-         len(findings), domains, n_new],
+         actual_rows, domains, n_new_actual, search_keywords if search_keywords != topic else ""],
     )
 
 
@@ -436,13 +499,19 @@ def main():
     run_id = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S")
     all_findings: list[Finding] = []
 
+    # Query templates use search_topic (short); the `findings`/`runs` tables
+    # keep args.topic (the full original description) as the identity key, so
+    # topic history/dedup grouping is unaffected -- only what actually gets
+    # typed into GitHub/DDG search changes.
+    search_topic = derive_search_topic(args.topic, use_llm=args.enrich)
+
     print("[pass] official sources (tier 1/2, keyless APIs) ...", file=sys.stderr)
-    all_findings.extend(run_official_sources(args.topic, run_id, args.max_results))
+    all_findings.extend(run_official_sources(search_topic, run_id, args.max_results))
 
     if not args.skip_scrape:
         for pass_type in PASS_TEMPLATES:
             print(f"[pass] {pass_type} (tier 2, ddg scrape) ...", file=sys.stderr)
-            all_findings.extend(run_pass(args.topic, pass_type, run_id, args.max_results))
+            all_findings.extend(run_pass(search_topic, pass_type, run_id, args.max_results))
 
     enrichment = None
     known_hashes: set[str] = set()
@@ -457,7 +526,7 @@ def main():
                 is_first_run = len(known_hashes) == 0
                 new_findings = [f for f in all_findings if f.content_hash not in known_hashes]
 
-                persist(client, args.topic, run_id, all_findings, n_new=len(new_findings))
+                persist(client, args.topic, run_id, all_findings, n_new=len(new_findings), search_keywords=search_topic)
                 print(f"[db] wrote {len(all_findings)} findings ({len(new_findings)} new) to Turso", file=sys.stderr)
 
                 if args.enrich and new_findings:
