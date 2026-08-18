@@ -1,2 +1,2 @@
-ddgs
+ddgs>=9.0
 libsql-client
