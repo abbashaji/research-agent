@@ -281,20 +281,27 @@ def run_pass(topic: str, pass_type: str, run_id: str, max_results: int = 8) -> l
         for tmpl in PASS_TEMPLATES[pass_type]:
             query = tmpl.format(topic=topic)
             results = _ddg_search(ddgs, query, pass_max_results)
-            if not results:
-                # Zero results isn't necessarily a dead end -- DDG's scrape
-                # surface is brittle against site: filters and exact-phrase
-                # quoting specifically, so try progressively broader rewrites
-                # of the SAME query before writing this pass off for the cycle.
+            # Broadening trades exact-phrase precision for recall by dropping
+            # quotes/site: filters -- fine for confirming/transactional/etc,
+            # where the templates are already loose keyword combinations. But
+            # adversarial's templates ARE the precision (quoted rejection
+            # phrases like "wontfix", "already exists") -- loosening those
+            # into a bag-of-words query invites off-topic noise from whichever
+            # engine handles long OR-heavy unquoted queries worst, rather than
+            # recovering a real miss. A real 0 here is legitimate signal (no
+            # adversarial chatter found), not a fetch failure to work around;
+            # the tier-1 GitHub wontfix source already covers this pass's
+            # precision-matching job without that tradeoff.
+            if not results and pass_type != "adversarial":
                 for variant in _broadened_variants(query):
                     print(f"  [broaden] no results for {query!r}, trying {variant!r}", file=sys.stderr)
                     results = _ddg_search(ddgs, variant, pass_max_results, retries=1)
                     if results:
                         query = variant  # record which query actually produced these
                         break
-                if not results:
-                    print(f"  [info] no results found (incl. broadened variants): {tmpl.format(topic=topic)!r}",
-                          file=sys.stderr)
+            if not results:
+                print(f"  [info] no results found (incl. broadened variants): {tmpl.format(topic=topic)!r}",
+                      file=sys.stderr)
             for r in results:
                 findings.append(to_finding(run_id, pass_type, query, r))
             time.sleep(1.5)  # be polite, avoid rate-limit bans -- keeps this free long-term
