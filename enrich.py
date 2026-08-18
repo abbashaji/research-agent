@@ -53,11 +53,16 @@ Your job:
 2. Write a synthesis paragraph (120-180 words): what's already on the market, \
    how crowded it is, what evidence (if any) of unmet pain exists, and what the \
    adversarial-pass findings say (do NOT omit or soften adversarial findings -- \
-   report them even if they undercut the opportunity). If ANY finding has \
-   pass_type "adversarial" or has_adversarial_signal=true, your synthesis MUST \
-   explicitly discuss it -- this is checked automatically after your response \
-   comes back, and a synthesis that has adversarial evidence available but \
-   doesn't address it will be flagged as defective.
+   report them even if they undercut the opportunity).
+   IMPORTANT -- precise terminology, checked automatically after your response:
+   only use the words "adversarial" or "adversarial finding(s)" if at least one \
+   finding in the input actually has pass_type "adversarial" or \
+   has_adversarial_signal=true. If there are none, do NOT use that word at all --
+   describe complaints/limitations/pain points you see in other findings using \
+   plain language instead (e.g. "known limitations", "user-reported issues", \
+   "reported performance problems"), never as "adversarial findings", since that \
+   specific term implies a maintainer/community explicitly pushed back on the \
+   idea, which is a stronger and different claim than "users mentioned a bug".
 3. Name the single clearest gap you can support with the evidence given, or \
    say "none found" if you can't -- do not invent a gap to sound useful.
 
@@ -194,18 +199,27 @@ def enrich_run(client, topic: str, run_id: str, findings: list, created_at: str)
     ]
     result = call_llm(payload)
 
-    # Post-hoc sanity check: if adversarial evidence existed in the input,
-    # verify the synthesis actually engaged with it rather than trusting the
-    # model's compliance with instruction #2 on faith. This can't verify the
-    # synthesis is RIGHT, only that adversarial evidence wasn't silently
-    # dropped -- still worth surfacing before treating "top_gap" as a verdict.
+    # Post-hoc sanity check, both directions:
+    # - n_adv > 0 but synthesis never engages with it -> evidence silently dropped.
+    # - n_adv == 0 but synthesis uses the word "adversarial" anyway -> the model
+    #   fabricated/overclaimed adversarial evidence that isn't actually in the
+    #   input (seen in practice: it relabeled ordinary complaint-signal findings
+    #   as "adversarial findings", which overstates them as maintainer/community
+    #   pushback rather than "a user mentioned a bug").
+    # This can't verify the synthesis is RIGHT either way, only that the
+    # adversarial_n number and the synthesis text agree with each other.
     n_adv = len(adversarial_findings)
     synthesis_text = (result.get("synthesis") or "").lower()
+    mentions_adversarial_word = "adversarial" in synthesis_text
     if n_adv == 0:
-        adv_check = "n/a: none in input"
-    elif any(kw in synthesis_text for kw in ("adversarial", "pushback", "wontfix", "won't fix",
-                                              "already exist", "not a problem", "not worth",
-                                              "unnecessary", "overkill", "pointless", "gimmick")):
+        if mentions_adversarial_word:
+            adv_check = "OVERCLAIM: synthesis says \"adversarial\" but 0 adversarial findings existed in input"
+            print(f"  [warn] enrichment overclaim for run {run_id}: {adv_check}", file=sys.stderr)
+        else:
+            adv_check = "n/a: none in input"
+    elif mentions_adversarial_word or any(kw in synthesis_text for kw in
+            ("pushback", "wontfix", "won't fix", "already exist", "not a problem",
+             "not worth", "unnecessary", "overkill", "pointless", "gimmick")):
         adv_check = "ok"
     else:
         adv_check = f"MISSING: {n_adv} adversarial finding(s) in input but synthesis never addresses them"
