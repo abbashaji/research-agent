@@ -224,6 +224,16 @@ def enrich_run(client, topic: str, run_id: str, findings: list, created_at: str)
     else:
         adv_check = f"MISSING: {n_adv} adversarial finding(s) in input but synthesis never addresses them"
         print(f"  [warn] enrichment adversarial check failed for run {run_id}: {adv_check}", file=sys.stderr)
+        # Logging a warning isn't enough on its own -- it sits in a CI log
+        # nobody re-reads, while the digest/enrichment table is what actually
+        # gets consulted later. Deterministically append what the model
+        # dropped, so the evidence survives in the record even when the LLM
+        # doesn't comply with the "don't omit adversarial findings" instruction.
+        titles = [f.title or f.url for f in adversarial_findings[:5]]
+        appendix = "Adversarial evidence found but not reflected above: " + "; ".join(titles)
+        if len(adversarial_findings) > 5:
+            appendix += f" (+{len(adversarial_findings) - 5} more)"
+        result["synthesis"] = (result.get("synthesis") or "").rstrip() + "\n\n" + appendix
 
     client.execute(
         """INSERT OR REPLACE INTO enrichment
