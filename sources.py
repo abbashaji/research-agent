@@ -58,6 +58,34 @@ def search_github_issues(query: str, repos: list[str], max_results: int = 8) -> 
     return out
 
 
+def search_github_issues_adversarial(query: str, repos: list[str], max_results: int = 8) -> list[dict]:
+    """Tier 1 ADVERSARIAL. Same API as search_github_issues, but filtered to
+    is:closed + label:wontfix -- a maintainer explicitly deciding not to
+    build/merge something is a much stronger "this may not be worth it"
+    signal than a DDG hit containing the word "overkill". This is real
+    evidence, not a regex guess, and it's tier 1: no other adversarial
+    source in this pipeline carries that weight."""
+    out = []
+    repo_filter = " ".join(f"repo:{r}" for r in repos)
+    q = urllib.parse.quote(f"{query} {repo_filter} is:closed label:wontfix")
+    try:
+        data = _get_json(f"https://api.github.com/search/issues?q={q}&per_page={max_results}",
+                          headers={"Accept": "application/vnd.github+json", "User-Agent": "rnd-research-agent/1.0"})
+        for item in data.get("items", []):
+            out.append({
+                "source": "github_issues_wontfix", "tier": 1,
+                "title": item.get("title", ""),
+                "snippet": (item.get("body") or "")[:500],
+                "url": item.get("html_url", ""),
+                "domain": "github.com",
+                "platform": "issue_tracker",
+                "engagement_signal": item.get("reactions", {}).get("total_count", 0),
+            })
+    except Exception as e:
+        print(f"  [warn] github_issues_adversarial quota/error, skipping: {e}", file=sys.stderr)
+    return out
+
+
 def search_devtalk(query: str, max_results: int = 8) -> list[dict]:
     """Tier 1. devtalk.blender.org Discourse JSON API, no auth required."""
     out = []
