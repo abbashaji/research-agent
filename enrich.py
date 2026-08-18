@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS enrichment (
     synthesis TEXT,          -- short paragraph: landscape, gaps, confidence
     cluster_count INTEGER,   -- deduped competitor/finding count
     top_gap TEXT,            -- single clearest unmet need, if any, else 'none found'
+    adversarial_n INTEGER,   -- how many adversarial-flagged findings existed in the input
+    adversarial_check TEXT,  -- 'ok' | 'MISSING: synthesis has adversarial evidence but never mentions it' | 'n/a: none in input'
     model_used TEXT,
     created_at TEXT
 );
@@ -51,7 +53,11 @@ Your job:
 2. Write a synthesis paragraph (120-180 words): what's already on the market, \
    how crowded it is, what evidence (if any) of unmet pain exists, and what the \
    adversarial-pass findings say (do NOT omit or soften adversarial findings -- \
-   report them even if they undercut the opportunity).
+   report them even if they undercut the opportunity). If ANY finding has \
+   pass_type "adversarial" or has_adversarial_signal=true, your synthesis MUST \
+   explicitly discuss it -- this is checked automatically after your response \
+   comes back, and a synthesis that has adversarial evidence available but \
+   doesn't address it will be flagged as defective.
 3. Name the single clearest gap you can support with the evidence given, or \
    say "none found" if you can't -- do not invent a gap to sound useful.
 
@@ -123,18 +129,57 @@ def call_llm(findings: list) -> dict:
 
 def enrich_run(client, topic: str, run_id: str, findings: list, created_at: str) -> dict:
     client.execute(ENRICH_SCHEMA)
+    # best-effort migration for enrichment tables created before these columns existed
+    for col, ddl in [("adversarial_n", "ALTER TABLE enrichment ADD COLUMN adversarial_n INTEGER"),
+                      ("adversarial_check", "ALTER TABLE enrichment ADD COLUMN adversarial_check TEXT")]:
+        try:
+            client.execute(ddl)
+        except Exception:
+            pass  # column already exists
+
+    # Order matters: the payload is truncated to 24000 chars before it goes to
+    # the LLM (call_llm), and findings were previously sent in whatever order
+    # they came out of the DB -- meaning adversarial/complaint evidence could
+    # silently fall off the end of a large run and never reach the model at
+    # all. Put it first so it's the last thing truncation would ever drop.
+    adversarial_findings = [f for f in findings if f.has_adversarial_signal]
+    complaint_findings = [f for f in findings if f.has_complaint_signal and not f.has_adversarial_signal]
+    other_findings = [f for f in findings if not f.has_adversarial_signal and not f.has_complaint_signal]
+    ordered = adversarial_findings + complaint_findings + other_findings
+
     payload = [
         {"pass_type": f.pass_type, "platform": f.platform, "domain": f.domain,
          "title": f.title, "snippet": f.snippet, "has_paid_signal": f.has_paid_signal,
          "has_adversarial_signal": f.has_adversarial_signal}
-        for f in findings
+        for f in ordered
     ]
     result = call_llm(payload)
+
+    # Post-hoc sanity check: if adversarial evidence existed in the input,
+    # verify the synthesis actually engaged with it rather than trusting the
+    # model's compliance with instruction #2 on faith. This can't verify the
+    # synthesis is RIGHT, only that adversarial evidence wasn't silently
+    # dropped -- still worth surfacing before treating "top_gap" as a verdict.
+    n_adv = len(adversarial_findings)
+    synthesis_text = (result.get("synthesis") or "").lower()
+    if n_adv == 0:
+        adv_check = "n/a: none in input"
+    elif any(kw in synthesis_text for kw in ("adversarial", "pushback", "wontfix", "won't fix",
+                                              "already exist", "not a problem", "not worth",
+                                              "unnecessary", "overkill", "pointless", "gimmick")):
+        adv_check = "ok"
+    else:
+        adv_check = f"MISSING: {n_adv} adversarial finding(s) in input but synthesis never addresses them"
+        print(f"  [warn] enrichment adversarial check failed for run {run_id}: {adv_check}", file=sys.stderr)
+
     client.execute(
         """INSERT OR REPLACE INTO enrichment
-           (run_id, topic, synthesis, cluster_count, top_gap, model_used, created_at)
-           VALUES (?,?,?,?,?,?,?)""",
+           (run_id, topic, synthesis, cluster_count, top_gap, adversarial_n, adversarial_check, model_used, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
         [run_id, topic, result.get("synthesis", ""), result.get("cluster_count"),
-         result.get("top_gap", ""), LLM_MODEL if GROQ_API_KEY else "none", created_at],
+         result.get("top_gap", ""), n_adv, adv_check,
+         LLM_MODEL if GROQ_API_KEY else "none", created_at],
     )
+    result["adversarial_n"] = n_adv
+    result["adversarial_check"] = adv_check
     return result
