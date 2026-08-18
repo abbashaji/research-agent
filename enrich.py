@@ -66,25 +66,21 @@ No markdown, no preamble, no code fences.
 """
 
 
-def call_llm(findings: list) -> dict:
+def _call_groq(messages: list, max_tokens: int = 1200, reasoning_effort: str = "low") -> str | None:
+    """Shared low-level Groq call. Returns raw response content string, or
+    None on any failure (caller decides the fallback -- this function doesn't
+    know whether "no answer" should mean "skip" or "use a heuristic instead")."""
     if not GROQ_API_KEY:
-        return {"cluster_count": None, "synthesis": "[enrichment skipped: GROQ_API_KEY not set]", "top_gap": "n/a"}
-
+        return None
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(findings)[:24000]},  # keep request small/cheap
-        ],
+        "messages": messages,
         "temperature": 0.2,
         # gpt-oss models are reasoning models -- Groq bills hidden reasoning
         # tokens against max_tokens too, so a low cap can be entirely eaten
-        # by reasoning and leave nothing for the actual JSON answer (this is
-        # exactly what happened with 500: empty content, "unparsed" top_gap).
-        # reasoning_effort="low" keeps that overhead small for a task this
-        # simple, and 1200 leaves comfortable room for the answer either way.
-        "max_tokens": 1200,
-        "reasoning_effort": "low",
+        # by reasoning and leave nothing for the actual answer.
+        "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
     }
     req = urllib.request.Request(
         LLM_BASE_URL,
@@ -103,24 +99,67 @@ def call_llm(findings: list) -> dict:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:500]
-        print(f"[llm] enrichment call failed: HTTP {e.code} -- {body}", file=sys.stderr)
-        return {"cluster_count": None, "synthesis": f"[enrichment failed: HTTP {e.code}]", "top_gap": "n/a"}
+        print(f"  [llm] call failed: HTTP {e.code} -- {body}", file=sys.stderr)
+        return None
     except urllib.error.URLError as e:
-        print(f"[llm] enrichment call failed: {e.reason}", file=sys.stderr)
-        return {"cluster_count": None, "synthesis": f"[enrichment failed: {e.reason}]", "top_gap": "n/a"}
+        print(f"  [llm] call failed: {e.reason}", file=sys.stderr)
+        return None
+    content = data["choices"][0]["message"]["content"].strip()
+    if not content:
+        finish_reason = data["choices"][0].get("finish_reason", "unknown")
+        print(f"  [llm] empty response, finish_reason={finish_reason}", file=sys.stderr)
+        return None
+    return content
 
-    raw = data["choices"][0]["message"]["content"].strip()
+
+KEYWORD_SYSTEM_PROMPT = """You turn a long, descriptive product-research topic into a short \
+search-engine query. The topic may be a full sentence or paragraph describing a target \
+user, use case, or product idea. Extract the 3-8 word phrase someone would actually type \
+into a search engine to find existing products/discussions about this -- concrete nouns \
+and the specific technology/domain terms, not the framing language around them.
+
+Example:
+Input: "Blender technical artists, VFX studios, and volumetric-capture practitioners who \
+need dynamic/temporal Gaussian Splatting data to become a first-class, artist-editable \
+citizen inside Blender's native Geometry Nodes procedural system, not just a static viewer."
+Output: gaussian splatting geometry nodes blender
+
+Output ONLY the short phrase. No quotes, no explanation, no punctuation at the end.
+"""
+
+
+def extract_search_keywords(topic: str) -> str | None:
+    """LLM-based shortening for long/descriptive topics, so narrow query
+    templates (adversarial, official-source exact/label search) have
+    something a search engine or GitHub's search API can actually match
+    against, instead of a full paragraph. Returns None on any failure --
+    caller should fall back to the heuristic, non-LLM shortener."""
+    content = _call_groq(
+        [{"role": "system", "content": KEYWORD_SYSTEM_PROMPT}, {"role": "user", "content": topic}],
+        max_tokens=60, reasoning_effort="low",
+    )
+    if not content:
+        return None
+    keywords = content.strip().strip('"').strip()
+    return keywords or None
+
+
+def call_llm(findings: list) -> dict:
+    if not GROQ_API_KEY:
+        return {"cluster_count": None, "synthesis": "[enrichment skipped: GROQ_API_KEY not set]", "top_gap": "n/a"}
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(findings)[:24000]},  # keep request small/cheap
+    ]
+    raw = _call_groq(messages, max_tokens=1200, reasoning_effort="low")
+    if raw is None:
+        return {"cluster_count": None, "synthesis": "[enrichment failed: see stderr log for details]", "top_gap": "n/a"}
     raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     if not raw:
-        # Distinguish "model answered but gave us nothing" from "model gave
-        # us text that just wasn't valid JSON" -- these have different fixes
-        # (raise max_tokens/reasoning_effort vs. tighten the prompt).
-        finish_reason = data["choices"][0].get("finish_reason", "unknown")
-        return {
-            "cluster_count": None,
-            "synthesis": f"[enrichment failed: empty response, finish_reason={finish_reason}]",
-            "top_gap": "n/a",
-        }
+        # _call_groq already screens out truly-empty content -- this only
+        # fires if the content was literally just markdown fences, e.g. "```json```".
+        return {"cluster_count": None, "synthesis": "[enrichment failed: empty after stripping markdown fences]", "top_gap": "n/a"}
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
