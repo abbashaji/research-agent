@@ -62,12 +62,25 @@ COMPLAINT_RE = re.compile(
     r"\b(wish|annoying|frustrat|workaround|hacky|no way to|can'?t figure|pain point|"
     r"tedious|manual(ly)?|slow to|time.?consuming)\b", re.I
 )
+# Broadened beyond the original 3 phrases -- covers issue-tracker rejection
+# language ("wontfix", "not planned"), dismissiveness ("pointless", "overkill",
+# "gimmick"), and "just do X manually instead" redirection, which are the
+# actual shapes adversarial pushback takes in the wild, not just "already exists".
 ADVERSARIAL_RE = re.compile(
     r"\b(already (solved|exists|does this)|not (a|really a) problem|use .* instead|"
-    r"non.?issue|works fine|don'?t need)\b", re.I
+    r"non.?issue|works fine|don'?t need|won'?t ?fix|wont ?fix|not planned|"
+    r"pointless|overkill|gimmick|just (do|use|export) .* manually|"
+    r"unnecessary|not worth (it|building)|reinvent(ing)? the wheel)\b", re.I
 )
 
-# The 5 pass types, matched to pmf-engine's method
+# The 5 pass types, matched to pmf-engine's method.
+#
+# adversarial and segment_fit deliberately get MORE templates than the others
+# now, not fewer -- they used to have just 1 query each, which structurally
+# starved them relative to confirming/transactional (3 and 2 templates), so a
+# run could look like strong market signal purely because the passes most
+# likely to surface reasons NOT to build something had the smallest sample
+# size going in, not because the pushback wasn't there.
 PASS_TEMPLATES = {
     "confirming": [
         "{topic} blender addon",
@@ -84,11 +97,34 @@ PASS_TEMPLATES = {
     ],
     "adversarial": [
         "{topic} blender addon \"already exists\" OR \"not a problem\" OR \"use instead\"",
+        "{topic} blender addon \"wontfix\" OR \"won't fix\" OR \"not planned\"",
+        "{topic} blender addon \"pointless\" OR \"overkill\" OR \"gimmick\"",
+        "{topic} blender \"just do it manually\" OR \"not worth building\"",
     ],
     "segment_fit": [
         "{topic} blender addon architects OR \"game dev\" OR \"archviz\"",
+        "{topic} blender addon indie OR hobbyist OR student",
     ],
 }
+
+# Query fallback rewrites, tried in order when a template comes back with
+# zero results. DDG's scrape surface is fragile and degrades unpredictably --
+# a query with quoted phrases and site: filters is the most likely to whiff,
+# so broaden progressively rather than just logging a warning and losing that
+# pass_type's coverage for the whole cycle.
+def _broadened_variants(query: str) -> list[str]:
+    variants = []
+    # 1. Drop site: filters -- these are the single biggest source of
+    #    "No results found" since DDG's index of any one site is incomplete.
+    no_site = re.sub(r"\s*site:\S+", "", query).strip()
+    if no_site != query:
+        variants.append(no_site)
+    # 2. Drop quoted exact phrases, keep the OR'd bare words -- exact-phrase
+    #    matching is brittle against paraphrased real-world text.
+    no_quotes = re.sub(r'"([^"]*)"', r"\1", no_site or query)
+    if no_quotes not in (query, no_site):
+        variants.append(no_quotes)
+    return variants
 
 
 @dataclass
@@ -146,6 +182,10 @@ def to_finding(run_id: str, pass_type: str, query: str, r: dict) -> Finding:
 def to_finding_from_source(run_id: str, pass_type: str, query: str, r: dict) -> Finding:
     """sources.py result (official API) -> Finding. Carries real tier + engagement."""
     blob = f"{r.get('title','')} {r.get('snippet','')}"
+    # A closed+wontfix GitHub issue IS adversarial signal by construction --
+    # a maintainer already made that call -- regardless of whether the ADVERSARIAL_RE
+    # regex happens to match the issue body text. Don't make this depend on wording.
+    forced_adversarial = r.get("source") == "github_issues_wontfix"
     return Finding(
         run_id=run_id,
         pass_type=pass_type,
@@ -157,7 +197,7 @@ def to_finding_from_source(run_id: str, pass_type: str, query: str, r: dict) -> 
         domain=r.get("domain", "unknown"),
         has_paid_signal=bool(PAID_SIGNAL_RE.search(blob)),
         has_complaint_signal=bool(COMPLAINT_RE.search(blob)),
-        has_adversarial_signal=bool(ADVERSARIAL_RE.search(blob)),
+        has_adversarial_signal=forced_adversarial or bool(ADVERSARIAL_RE.search(blob)),
         fetched_at=dt.datetime.now(dt.UTC).isoformat(),
         content_hash=hashlib.sha256(blob.encode()).hexdigest()[:16],
         tier=r.get("tier", 1),
@@ -165,17 +205,56 @@ def to_finding_from_source(run_id: str, pass_type: str, query: str, r: dict) -> 
     )
 
 
+def _ddg_search(ddgs: DDGS, query: str, max_results: int, retries: int = 2) -> list[dict]:
+    """One query against DDG with a short retry-with-backoff for transient
+    failures (rate limits, momentary markup changes). Distinguishes "0
+    results" (not an error -- log at info level, try a broadened variant)
+    from an actual exception (retry, then give up and warn)."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            results = list(ddgs.text(query, max_results=max_results))
+            return results
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                backoff = 2 * (attempt + 1)
+                print(f"  [retry] {query!r} failed ({e}), retrying in {backoff}s "
+                      f"({attempt + 1}/{retries})...", file=sys.stderr)
+                time.sleep(backoff)
+    print(f"  [warn] query failed after {retries + 1} attempts: {query!r} -> {last_exc}", file=sys.stderr)
+    return []
+
+
 def run_pass(topic: str, pass_type: str, run_id: str, max_results: int = 8) -> list[Finding]:
-    """Tier 2: general-web via DuckDuckGo scrape."""
+    """Tier 2: general-web via DuckDuckGo scrape.
+
+    adversarial gets a max_results boost -- it's the pass most likely to
+    surface reasons NOT to build something, and with only 1-4 templates vs.
+    confirming's higher query-diversity, it needs more results per query to
+    end up with a comparable sample, not a structurally thinner one."""
     findings = []
+    pass_max_results = max_results * 2 if pass_type == "adversarial" else max_results
     with DDGS() as ddgs:
         for tmpl in PASS_TEMPLATES[pass_type]:
             query = tmpl.format(topic=topic)
-            try:
-                for r in ddgs.text(query, max_results=max_results):
-                    findings.append(to_finding(run_id, pass_type, query, r))
-            except Exception as e:
-                print(f"  [warn] query failed: {query!r} -> {e}", file=sys.stderr)
+            results = _ddg_search(ddgs, query, pass_max_results)
+            if not results:
+                # Zero results isn't necessarily a dead end -- DDG's scrape
+                # surface is brittle against site: filters and exact-phrase
+                # quoting specifically, so try progressively broader rewrites
+                # of the SAME query before writing this pass off for the cycle.
+                for variant in _broadened_variants(query):
+                    print(f"  [broaden] no results for {query!r}, trying {variant!r}", file=sys.stderr)
+                    results = _ddg_search(ddgs, variant, pass_max_results, retries=1)
+                    if results:
+                        query = variant  # record which query actually produced these
+                        break
+                if not results:
+                    print(f"  [info] no results found (incl. broadened variants): {tmpl.format(topic=topic)!r}",
+                          file=sys.stderr)
+            for r in results:
+                findings.append(to_finding(run_id, pass_type, query, r))
             time.sleep(1.5)  # be polite, avoid rate-limit bans -- keeps this free long-term
     return findings
 
@@ -185,6 +264,13 @@ def run_official_sources(topic: str, run_id: str, max_results: int = 8) -> list[
     findings = []
     for r in sources.search_github_issues(topic, GITHUB_REPOS, max_results):
         findings.append(to_finding_from_source(run_id, "official_github", topic, r))
+    time.sleep(1)
+    # Tier-1 adversarial: closed+wontfix issues are a maintainer explicitly
+    # declining to build/merge something -- stronger signal than any DDG
+    # scrape hit, and pass_type="adversarial" so it counts toward the same
+    # gate check as the tier-2 adversarial pass instead of being invisible to it.
+    for r in sources.search_github_issues_adversarial(topic, GITHUB_REPOS, max_results):
+        findings.append(to_finding_from_source(run_id, "adversarial", topic, r))
     time.sleep(1)
     for r in sources.search_devtalk(topic, max_results):
         findings.append(to_finding_from_source(run_id, "official_devtalk", topic, r))
@@ -329,7 +415,7 @@ def build_digest(topic: str, run_id: str, findings: list[Finding],
     lines.append("## Gate signal (pmf-engine style, mechanical read — verify before trusting)")
     lines.append(f"- source diversity: {len(domains)} domains ({'OK 3+' if len(domains) >= 3 else 'THIN'})")
     lines.append(f"- transactional evidence (new): {len(paid)} hits")
-    lines.append(f"- adversarial pass (new): {'completed, ' + str(len(adversarial)) + ' hits' if by_pass.get('adversarial') or by_pass.get('official_github') else 'check raw log'}")
+    lines.append(f"- adversarial pass (new): {'completed, ' + str(len(adversarial)) + ' hits' if by_pass.get('adversarial') else 'check raw log'}")
     lines.append(f"- tier1/tier2 disagreement: review manually if tier-1 and tier-2 findings point opposite directions — that's signal, not noise to average away")
     return "\n".join(lines)
 
@@ -390,10 +476,13 @@ def main():
 
     digest = build_digest(args.topic, run_id, all_findings, known_hashes, is_first_run)
     if enrichment:
+        adv_check = enrichment.get("adversarial_check", "")
+        adv_line = f"**Adversarial check:** {adv_check}\n\n" if adv_check and adv_check != "n/a: none in input" else ""
         digest = (
             f"## LLM synthesis of NEW findings (deduped clusters: {enrichment.get('cluster_count')})\n"
             f"{enrichment.get('synthesis')}\n\n"
             f"**Top gap:** {enrichment.get('top_gap')}\n\n"
+            f"{adv_line}"
             + digest
         )
     print(digest)
