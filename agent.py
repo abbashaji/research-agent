@@ -41,6 +41,17 @@ import sources
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL")       # e.g. libsql://your-db-org.turso.io
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
+# ddgs (the installed lib, v9.15+) is actually a metasearch aggregator, not
+# just a DuckDuckGo scraper -- it can fall back across several real engines.
+# We observed a run where DuckDuckGo alone returned near-random/trending junk
+# instead of query-matched results (no exception raised, so retry-on-error
+# never caught it) -- listing multiple engines here means a bad day for any
+# one of them doesn't take out the whole pass. wikipedia/grokipedia are
+# deliberately excluded (encyclopedic, not useful for finding forum/
+# marketplace/issue-tracker content). Override via env var if you want to
+# pin to one engine for debugging (e.g. DDGS_BACKEND=duckduckgo).
+DDGS_BACKEND = os.environ.get("DDGS_BACKEND", "duckduckgo,brave,mojeek,startpage,yahoo")
+
 # Repos genuinely hosted on GitHub -- NOT blender/blender (see sources.py note)
 GITHUB_REPOS = ["KhronosGroup/glTF-Blender-IO", "PixarAnimationStudios/OpenUSD", "alembic/alembic"]
 
@@ -231,14 +242,20 @@ def to_finding_from_source(run_id: str, pass_type: str, query: str, r: dict) -> 
 
 
 def _ddg_search(ddgs: DDGS, query: str, max_results: int, retries: int = 2) -> list[dict]:
-    """One query against DDG with a short retry-with-backoff for transient
-    failures (rate limits, momentary markup changes). Distinguishes "0
-    results" (not an error -- log at info level, try a broadened variant)
-    from an actual exception (retry, then give up and warn)."""
+    """Multi-engine metasearch via ddgs, with a short retry-with-backoff for
+    transient failures (rate limits, momentary markup changes) on top.
+    Distinguishes "0 results" (not an error -- log at info level, try a
+    broadened variant) from an actual exception (retry, then give up and warn).
+
+    Uses DDGS_BACKEND (several engines) rather than DuckDuckGo alone, since
+    we've observed DuckDuckGo return near-random/trending junk with a 200
+    response (no exception) rather than actually failing -- retry logic can't
+    catch that, but a different engine in the list is less likely to be
+    degraded on the same day for the same reason."""
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            results = list(ddgs.text(query, max_results=max_results))
+            results = list(ddgs.text(query, max_results=max_results, backend=DDGS_BACKEND))
             return results
         except Exception as e:
             last_exc = e
