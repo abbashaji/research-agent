@@ -120,7 +120,14 @@ PASS_TEMPLATES = {
     ],
     "segment_fit": [
         "{topic} blender addon architects OR \"game dev\" OR \"archviz\"",
-        "{topic} blender addon indie OR hobbyist OR student",
+        # Was "... OR hobbyist OR student" -- "student" alone is exactly the
+        # kind of bare generic word that broke adversarial earlier (see
+        # ADVERSARIAL_RE comment above): it pulled back student-portal LOGIN
+        # PAGES (a university SSO page, ClassLink, a Microsoft login screen)
+        # with zero relation to Blender. Compound phrases anchor the engine
+        # to the actual intended sense instead of matching the bare word
+        # anywhere on the page.
+        "{topic} blender addon \"indie developer\" OR \"student project\" OR hobbyist",
     ],
 }
 
@@ -527,7 +534,12 @@ def build_digest(topic: str, run_id: str, findings: list[Finding],
     lines.append("## Gate signal (pmf-engine style, mechanical read — verify before trusting)")
     lines.append(f"- source diversity: {len(domains)} domains ({'OK 3+' if len(domains) >= 3 else 'THIN'})")
     lines.append(f"- transactional evidence (new): {len(paid)} hits")
-    lines.append(f"- adversarial pass (new): {'completed, ' + str(len(adversarial)) + ' hits' if by_pass.get('adversarial') else 'check raw log'}")
+    adversarial_ran = "adversarial" in {f.pass_type for f in findings}  # true if the pass_type appears anywhere this run, new or not
+    if adversarial_ran:
+        adv_line = f"completed, {len(adversarial)} new hit(s)" if adversarial else "completed, 0 new hits (no adversarial evidence found this cycle -- that's a real result, not a failure)"
+    else:
+        adv_line = "did not run or produced nothing at all -- check raw log for [warn]/[info] lines"
+    lines.append(f"- adversarial pass (new): {adv_line}")
     lines.append(f"- tier1/tier2 disagreement: review manually if tier-1 and tier-2 findings point opposite directions — that's signal, not noise to average away")
     return "\n".join(lines)
 
